@@ -1,0 +1,589 @@
+#include "array"
+#include "cstring"
+#include "esp_heap_caps.h"
+#include "esp_image_format.h"
+#include "esp_log.h"
+#include "esp_netif.h"
+#include "esp_ota_ops.h"
+#include "esp_partition.h"
+#include "esp_timer.h"
+#include "esp_wifi.h"
+
+#include "map"
+#include <inttypes.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/task.h"
+
+#include "driver/gpio.h"
+#include "esp_mac.h"
+
+#include "mdf_common.h"
+#include "mqtt_handler.h"
+#include "mwifi.h"
+
+#include "comm_core.h"
+#include "comm_macros.h"
+#include "comm_sec.h"
+#include "comm_types.h"
+#include "espnow.h"
+#include "espnow_ota.h"
+
+#define _ROOT
+
+// #define OTA_INIT
+
+// #define EVE
+#define GPIO_INPUT_IO_0 GPIO_NUM_12
+#define GPIO_INPUT_IO_1 GPIO_NUM_13
+
+#define GPIO_INPUT_PIN_SEL                                                     \
+  ((1ULL << GPIO_INPUT_IO_0) | (1ULL << GPIO_INPUT_IO_1))
+
+static const char *TAG = "comm_core";
+static esp_netif_t *sta_netif;
+static int test_payload = 0;
+static bool is_ch = false;
+mwifi_config_t nw_mdf_config = {0};
+static bool get_ip = false;
+typedef std::array<uint8_t, 6> nw_mac_t;
+std::map<nw_mac_t, int8_t> nw_table;
+
+static void nw_creation_task(void *params);
+
+// mwifi_node_type_t nw_mdf_node_type = MWIFI_MESH_NODE;
+#define CONFIG_MESH_CHANNEL 13
+
+#ifdef OTA_INIT
+esp_image_metadata_t check;
+
+esp_err_t ota_initator_data_cb(size_t src_offset, void *dst, size_t size) {
+  static const esp_partition_t *data_partition = NULL;
+
+  if (!data_partition) {
+    data_partition = esp_ota_get_next_update_partition(NULL);
+  }
+
+  return esp_partition_read(data_partition, src_offset, dst, size);
+}
+
+static void firmware_send(size_t firmware_size,
+                          uint8_t sha[ESPNOW_OTA_HASH_LEN]) {
+  esp_err_t ret = ESP_OK;
+  uint32_t start_time = xTaskGetTickCount();
+  espnow_ota_result_t espnow_ota_result = {0};
+  espnow_ota_responder_t *info_list = NULL;
+  size_t num = 0;
+
+  espnow_ota_initator_scan(&info_list, &num, pdMS_TO_TICKS(3000));
+  ESP_LOGW(TAG, "espnow wait ota num: %d", num);
+
+  espnow_addr_t *dest_addr_list =
+      (espnow_addr_t *)ESP_MALLOC(num * ESPNOW_ADDR_LEN);
+
+  for (size_t i = 0; i < num; i++) {
+    memcpy(dest_addr_list[i], info_list[i].mac, ESPNOW_ADDR_LEN);
+  }
+
+  ESP_FREE(info_list);
+
+  ret = espnow_ota_initator_send(dest_addr_list, num, sha, firmware_size,
+                                 ota_initator_data_cb, &espnow_ota_result);
+  ESP_ERROR_GOTO(ret != ESP_OK, EXIT, "<%s> espnow_ota_initator_send",
+                 esp_err_to_name(ret));
+
+  if (espnow_ota_result.successed_num == 0) {
+    ESP_LOGW(TAG, "Devices upgrade failed, unfinished_num: %d",
+             espnow_ota_result.unfinished_num);
+    goto EXIT;
+  }
+
+  ESP_LOGI(TAG, "Firmware is sent to the device to complete, Spend time: %ds",
+           (xTaskGetTickCount() - start_time) * portTICK_RATE_MS / 1000);
+  ESP_LOGI(TAG,
+           "Devices upgrade completed, successed_num: %d, unfinished_num: %d",
+           espnow_ota_result.successed_num, espnow_ota_result.unfinished_num);
+
+EXIT:
+  espnow_ota_initator_result_free(&espnow_ota_result);
+}
+
+#endif
+
+static mdf_err_t event_loop_cb(mdf_event_loop_t event, void *ctx) {
+  MDF_LOGI("event_loop_cb, event: %d", event);
+
+  switch (event) {
+  case MDF_EVENT_MWIFI_STARTED:
+    MDF_LOGI("MESH is started");
+    break;
+
+  case MDF_EVENT_MWIFI_PARENT_CONNECTED:
+    MDF_LOGI("Parent is connected on station interface");
+    if (esp_mesh_is_root()) {
+      esp_netif_dhcpc_start(sta_netif);
+    }
+    break;
+
+  case MDF_EVENT_MWIFI_PARENT_DISCONNECTED:
+    MDF_LOGI("Parent is disconnected on station interface");
+    if (esp_mesh_is_root()) {
+      mesh_mqtt_stop();
+    }
+    break;
+
+  case MDF_EVENT_MWIFI_ROOT_GOT_IP: {
+    MDF_LOGW("Root obtains the IP address. It is posted by LwIP stack "
+             "automatically");
+    get_ip = true;
+
+    // xTaskCreate(root_write_task, "root_write", 4 * 1024, NULL,
+    //             CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+    // xTaskCreate(root_read_task, "root_read", 4 * 1024, NULL,
+    //             CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+
+    break;
+  }
+  case MDF_EVENT_MWIFI_ROOT_LOST_IP:
+    MDF_LOGE("Root Lost IP");
+    get_ip = false;
+    break;
+
+  case MDF_EVENT_CUSTOM_MQTT_CONNECTED: {
+    MDF_LOGI("MQTT connect");
+    mdf_err_t err = mesh_mqtt_subscribe();
+    if (err != MDF_OK) {
+      MDF_LOGE("Subscribe failed");
+    }
+
+    // mwifi_post_root_status(true);
+    break;
+  }
+  case MDF_EVENT_CUSTOM_MQTT_DISCONNECTED:
+    MDF_LOGI("MQTT disconnected");
+    // mwifi_post_root_status(false);
+    break;
+
+  default:
+    break;
+  }
+
+  return MDF_OK;
+}
+
+#ifdef _ROOT
+static void root_task(void *params) {
+  mdf_err_t ret = MDF_OK;
+  nw_packet_t *data = (nw_packet_t *)MDF_MALLOC(MWIFI_PAYLOAD_LEN);
+  size_t size = MWIFI_PAYLOAD_LEN;
+  uint8_t src_addr[MWIFI_ADDR_LEN] = {0x0};
+  mwifi_data_type_t data_type = {0};
+  int32_t now = 0;
+  cJSON *graphs_j = NULL;
+  cJSON *graph_j = NULL;
+  cJSON *id_j = NULL;
+  cJSON *neighbors_j = NULL;
+  cJSON *neighbor_j = NULL;
+  cJSON *rssi_j = NULL;
+  char temp_buffer[100] = {0};
+
+  MDF_LOGI("Root is running");
+
+  while (!mwifi_is_started()) {
+    vTaskDelay(500 / portTICK_RATE_MS);
+  }
+  int32_t base_time = MILLIS();
+  graphs_j = cJSON_CreateArray();
+  while (esp_mesh_get_total_node_num() == 1) {
+  } // block till some connections;
+  do {
+    now = MILLIS();
+
+    size = MWIFI_PAYLOAD_LEN;
+    memset(data, 0, MWIFI_PAYLOAD_LEN);
+    ret = mwifi_root_read(src_addr, &data_type, (uint8_t *)data, &size,
+                          pdMS_TO_TICKS(NW_MDF_ROOT_READ_TIMEOUT));
+    MDF_ERROR_CONTINUE(ret != MDF_OK, "<%s> mwifi_root_read",
+                       mdf_err_to_name(ret));
+
+    MDF_LOGI("Root receive, addr: " MACSTR ", size: %d, header size: %d",
+             MAC2STR(src_addr), size, data->header.size);
+    memset(temp_buffer, 0, 100);
+    graph_j = cJSON_CreateObject();
+    sprintf(temp_buffer, MACSTR, MAC2STR(src_addr));
+    cJSON_AddStringToObject(graph_j, "id", temp_buffer);
+    neighbors_j = cJSON_CreateArray();
+    for (int i = 0; i < data->header.size; i++) {
+      neighbor_j = cJSON_CreateObject();
+      nw_mdf_graph_table_packet_t *table_packet =
+          (nw_mdf_graph_table_packet_t *)&data
+              ->body[i * sizeof(nw_mdf_graph_table_packet_t)];
+      ESP_LOGW(TAG, "address: " MACSTR, MAC2STR(table_packet->addr));
+      ESP_LOGW(TAG, "rssi: %d", table_packet->rssi);
+      ESP_LOGW(TAG, "------------");
+      memset(temp_buffer, 0, 100);
+      sprintf(temp_buffer, MACSTR, MAC2STR(table_packet->addr));
+      cJSON_AddStringToObject(neighbor_j, "id", temp_buffer);
+      cJSON_AddNumberToObject(neighbor_j, "rssi", table_packet->rssi);
+      cJSON_AddItemToArray(neighbors_j, neighbor_j);
+    }
+    cJSON_AddItemToObject(graph_j, "neighbor", neighbors_j);
+
+    cJSON_AddItemToArray(graphs_j, graph_j);
+    base_time = MILLIS();
+  } while (!CHECK_TIMEOUT(base_time, now, NW_MDF_GRAPH_TIMEOUT));
+
+  // size = sprintf(data, "(%d) Hello node!", i);
+  // ret = mwifi_root_write(src_addr, 1, &data_type, data, size, true);
+  // MDF_ERROR_CONTINUE(ret != MDF_OK, "mwifi_root_write, ret: %x", ret);
+  // MDF_LOGI("Root send, addr: " MACSTR ", size: %d, data: %s",
+  //          MAC2STR(src_addr), size, data);
+
+  MDF_LOGW("Root is exit");
+  char *logdebug = cJSON_Print(graphs_j);
+  ESP_LOGW(TAG, "%s", logdebug);
+  MDF_FREE(data);
+  while (!get_ip) {
+    ESP_LOGE(TAG, "wait to get ip");
+  }
+  mesh_mqtt_set_graph(graphs_j);
+  mesh_mqtt_start("mqtt://mqtt.fluux.io");
+
+  vTaskDelete(NULL);
+}
+#else
+
+static void node_write_task(void *arg) {
+  mdf_err_t ret = MDF_OK;
+  int count = 0;
+  size_t size = 0;
+  nw_packet_t *data = (nw_packet_t *)MDF_MALLOC(MWIFI_PAYLOAD_LEN);
+  mwifi_data_type_t data_type = {0x0};
+  data->header.size = nw_table.size();
+
+  MDF_LOGI("Node write task is running and want to send %d data",
+           data->header.size);
+
+  for (;;) {
+    if (!mwifi_is_connected()) {
+      vTaskDelay(500 / portTICK_RATE_MS);
+      continue;
+    }
+    int i = 0;
+    for (std::map<nw_mac_t, int8_t>::iterator it = nw_table.begin();
+         it != nw_table.end(); it++) {
+      nw_mdf_graph_table_packet_t table_packet = {0};
+      for (int j = 0; j < 6; j++) {
+        table_packet.addr[j] = it->first[j];
+      }
+      // memcpy(table_packet.addr, it->first, 6);
+      table_packet.rssi = it->second;
+      memcpy(data->body + i * sizeof(nw_mdf_graph_table_packet_t),
+             (uint8_t *)&table_packet, sizeof(nw_mdf_graph_table_packet_t));
+      i++;
+    }
+    size = sizeof(nw_packet_t) +
+           nw_table.size() * sizeof(nw_mdf_graph_table_packet_t);
+    ret = mwifi_write(NULL, &data_type, data, size, true);
+    MDF_ERROR_CONTINUE(ret != MDF_OK, "mwifi_write, ret: %x", ret);
+    break;
+    vTaskDelay(1000 / portTICK_RATE_MS);
+  }
+
+  MDF_LOGW("Node write task is exit");
+
+  MDF_FREE(data);
+  vTaskDelete(NULL);
+}
+
+#endif //_ROOT
+
+static void wifi_init() {
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+
+  ESP_ERROR_CHECK(esp_netif_create_default_wifi_mesh_netifs(&sta_netif, NULL));
+
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_FLASH));
+  ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));
+  MDF_ERROR_ASSERT(esp_mesh_set_6m_rate(false));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  ESP_ERROR_CHECK(
+      esp_wifi_set_channel(CONFIG_MESH_CHANNEL, WIFI_SECOND_CHAN_NONE));
+  ESP_ERROR_CHECK(esp_wifi_set_protocol(
+      WIFI_IF_STA, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N |
+                       WIFI_PROTOCOL_LR));
+}
+
+// static void print_graph_table(std::map<nw_mac_t, int8_t> nw_table) {
+
+//   ESP_LOGI(TAG, "start to print table");
+//   std::map<nw_mac_t, int8_t>::iterator it;
+//   for (it = nw_table.begin(); it != nw_table.end(); it++) {
+//     printf("mac: " MACSTR " : rssi: %d \r\n", MAC2STR(it->first),
+//     it->second);
+//   }
+// }
+
+static void nw_neighbors_task(void *params) {
+  ESP_LOGI(TAG, "nw_neighbors start");
+
+  esp_err_t err = ESP_OK;
+  size_t size = ESPNOW_DATA_LEN;
+  nw_packet_t *data =
+      (nw_packet_t *)heap_caps_malloc(ESPNOW_DATA_LEN, MALLOC_CAP_8BIT);
+  uint8_t addr[ESPNOW_ADDR_LEN] = {0};
+  wifi_pkt_rx_ctrl_t rx_ctrl = {0};
+  nw_mac_t nw_mac = {0};
+  int32_t base_time = MILLIS();
+  int len = sizeof(nw_packet_t) + sizeof(nw_creation_beacon_packet_t);
+  espnow_frame_head_t frame_head = {
+      .broadcast = true,
+      .retransmit_count = 10,
+  };
+  ESP_LOGI(TAG, "ready to nw packet");
+
+  nw_packet_t *bc_packet =
+      (nw_packet_t *)heap_caps_malloc(len, MALLOC_CAP_DEFAULT);
+  ESP_LOGI(TAG, " [%d , %d , %d ]", sizeof(nw_packet_t),
+           sizeof(nw_creation_beacon_packet_t), xPortGetCoreID());
+  bc_packet->header.seq = 0;
+  bc_packet->header.size = sizeof(nw_creation_beacon_packet_t);
+  bc_packet->header.type = NW_CREATION_BEACON_TYPE;
+
+  int32_t now = 0;
+  do {
+    now = MILLIS();
+    vTaskDelay(10);
+    memcpy(bc_packet->body, &test_payload, sizeof(int));
+    err = espnow_send(ESPNOW_TYPE_SCPS_NW, ESPNOW_ADDR_BROADCAST, bc_packet,
+                      len, &frame_head, pdMS_TO_TICKS(NW_DISCOVERY_BC_TIMEOUT));
+    ESP_ERROR_CONTINUE(err != ESP_OK, "<%s> espnow_send", esp_err_to_name(err));
+    ESP_LOGW(TAG, "data is send %d", test_payload);
+    test_payload++;
+
+    err = espnow_recv(ESPNOW_TYPE_SCPS_NW, addr, (uint8_t *)data, &size,
+                      &rx_ctrl, pdMS_TO_TICKS(NW_DISCOVERY_BC_TIMEOUT));
+    ESP_ERROR_CONTINUE(err != ESP_OK, "");
+    if (data->header.type == NW_CREATION_BEACON_TYPE) {
+
+      for (int i = 0; i < nw_mac.size(); i++) {
+        nw_mac[i] = addr[i];
+      }
+      nw_table[nw_mac] = rx_ctrl.rssi;
+      ESP_LOGW(TAG, "data is received %d : %d and nw mac size %d",
+               data->header.size, *(int *)data->body, nw_mac.size());
+    }
+
+  } while (!CHECK_TIMEOUT(base_time, now, NW_DISCOVERY_TIMEOUT));
+
+  ESP_LOGI(TAG, "nw discovery finished  : %d", nw_table.size());
+
+  //   uint8_t CONFIG_MESH_ID[6] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6};
+
+  //   mwifi_init_config_t cfg = MWIFI_INIT_CONFIG_DEFAULT();
+  //   nw_mdf_config.channel = CONFIG_MESH_CHANNEL;
+  //   memcpy(nw_mdf_config.mesh_id, CONFIG_MESH_ID, 6);
+
+  // #ifdef _ROOT
+  //   nw_mdf_config.mesh_type = MWIFI_MESH_ROOT;
+  //   memcpy(nw_mdf_config.router_ssid, "goldenButt", 11);
+  //   memcpy(nw_mdf_config.router_password, "mohyfahim", 10);
+  // #else
+  //   nw_mdf_config.mesh_type = MWIFI_MESH_NODE;
+  // #endif
+
+  //   ESP_LOGW(TAG, "type of node %d", nw_mdf_config.mesh_type);
+
+  //   MDF_ERROR_ASSERT(mdf_event_loop_init(event_loop_cb));
+  //   MDF_ERROR_ASSERT(mwifi_init(&cfg));
+  //   MDF_ERROR_ASSERT(mwifi_set_config(&nw_mdf_config));
+  //   MDF_ERROR_ASSERT(mwifi_start());
+  // #ifdef _ROOT
+  //   xTaskCreate(root_task, "root_task", 4 * 1024, NULL,
+  //               CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+  // #else
+  //   xTaskCreate(node_write_task, "node_write_task", 4 * 1024, NULL,
+  //               CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+  // // xTaskCreate(node_read_task, "node_read_task", 4 * 1024, NULL,
+  // //             CONFIG_MDF_TASK_DEFAULT_PRIOTY, NULL);
+  // #endif
+  test_payload = 0;
+  free(bc_packet);
+  free(data);
+  // xTaskCreatePinnedToCore(nw_creation_task, "nw_check", 3 * 1024, NULL, 1,
+  // NULL,
+  //                         0);
+  vTaskDelete(NULL);
+}
+
+static void nw_creation_task(void *params) {
+  esp_err_t err = 0;
+  size_t size = ESPNOW_DATA_LEN;
+  uint8_t *data = (uint8_t *)heap_caps_malloc(ESPNOW_DATA_LEN, MALLOC_CAP_8BIT);
+  uint8_t addr[ESPNOW_ADDR_LEN] = {0};
+  wifi_pkt_rx_ctrl_t rx_ctrl = {0};
+
+  bool state = true;
+  bool secstate = true;
+  ESP_LOGW(TAG, "start checking pins or packet!");
+  while (true) {
+
+    if (state != gpio_get_level(GPIO_INPUT_IO_0)) {
+      ESP_LOGW(TAG, "toggle");
+// #ifdef OTA_INIT
+//       firmware_send(check.image_len, check.image_digest);
+// #endif
+      // xTaskCreatePinnedToCore(nw_neighbors_task, "nw_dic", 4 * 1024, NULL, 1,
+      //                         NULL, 0);
+      ESP_LOGW(TAG, "assign as ch");
+      nw_security_assign_ch(true);
+      break;
+    }
+    err = espnow_recv(ESPNOW_TYPE_SCPS_NW, addr, data, &size, &rx_ctrl,
+                      pdMS_TO_TICKS(NW_DISCOVERY_BC_TIMEOUT));
+    ESP_ERROR_CONTINUE(err != ESP_OK, "");
+
+    nw_packet_t *nw_packet = (nw_packet_t *)data;
+    if (nw_packet->header.type == NW_CREATION_BEACON_TYPE &&
+        *(int *)nw_packet->body < 3) {
+      ESP_LOGW(TAG, "packet received:  %d", *(int *)nw_packet->body);
+      xTaskCreatePinnedToCore(nw_neighbors_task, "nw_dic", 4 * 1024, NULL, 1,
+                              NULL, 0);
+      break;
+    }
+    if (secstate != gpio_get_level(GPIO_INPUT_IO_1)) {
+      ESP_LOGW(TAG, "toggle");
+      if (secstate) {
+        reading_logs();
+      }
+      secstate = 1 - secstate;
+    }
+    vTaskDelay(pdMS_TO_TICKS(300));
+  }
+
+  free(data);
+  vTaskDelete(NULL);
+}
+
+static void print_system_info_timercb(void *timer) {
+  uint8_t primary = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  mesh_addr_t parent_bssid = {0};
+  uint8_t sta_mac[MWIFI_ADDR_LEN] = {0};
+  wifi_sta_list_t wifi_sta_list = {0x0};
+
+  esp_wifi_get_mac(WIFI_IF_STA, sta_mac);
+  esp_wifi_ap_get_sta_list(&wifi_sta_list);
+  esp_wifi_get_channel(&primary, &second);
+  esp_mesh_get_parent_bssid(&parent_bssid);
+
+  MDF_LOGI("System information, channel: %d, layer: %d, self mac: " MACSTR
+           ", parent bssid: " MACSTR
+           ", parent rssi: %d, node num: %d, free heap: %u",
+           primary, esp_mesh_get_layer(), MAC2STR(sta_mac),
+           MAC2STR(parent_bssid.addr), mwifi_get_parent_rssi(),
+           esp_mesh_get_total_node_num(), esp_get_free_heap_size());
+
+  for (int i = 0; i < wifi_sta_list.num; i++) {
+    MDF_LOGI("Child mac: " MACSTR, MAC2STR(wifi_sta_list.sta[i].mac));
+  }
+
+#ifdef MEMORY_DEBUG
+
+  if (!heap_caps_check_integrity_all(true)) {
+    MDF_LOGE("At least one heap is corrupt");
+  }
+
+  mdf_mem_print_heap();
+  mdf_mem_print_record();
+  mdf_mem_print_task();
+#endif /**< MEMORY_DEBUG */
+}
+
+// static void node_read_task(void *arg) {
+//   mdf_err_t ret = MDF_OK;
+//   char *data = (char *)MDF_MALLOC(MWIFI_PAYLOAD_LEN);
+//   size_t size = MWIFI_PAYLOAD_LEN;
+//   mwifi_data_type_t data_type = {0x0};
+//   uint8_t src_addr[MWIFI_ADDR_LEN] = {0x0};
+
+//   MDF_LOGI("Note read task is running");
+
+//   for (;;) {
+//     if (!mwifi_is_connected()) {
+//       vTaskDelay(500 / portTICK_RATE_MS);
+//       continue;
+//     }
+
+//     size = MWIFI_PAYLOAD_LEN;
+//     memset(data, 0, MWIFI_PAYLOAD_LEN);
+//     ret = mwifi_read(src_addr, &data_type, data, &size, portMAX_DELAY);
+//     MDF_ERROR_CONTINUE(ret != MDF_OK, "mwifi_read, ret: %x", ret);
+//     MDF_LOGI("Node receive, addr: " MACSTR ", size: %d, data: %s",
+//              MAC2STR(src_addr), size, data);
+//   }
+
+//   MDF_LOGW("Note read task is exit");
+
+//   MDF_FREE(data);
+//   vTaskDelete(NULL);
+// }
+
+void commu_task_start() {
+
+  ESP_LOGI(TAG, "commu task started");
+  esp_err_t err = 0;
+  gpio_config_t io_conf = {};
+
+  io_conf.intr_type = GPIO_INTR_DISABLE;
+  io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+  io_conf.pin_bit_mask = GPIO_INPUT_PIN_SEL;
+  io_conf.mode = GPIO_MODE_INPUT;
+  io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+  gpio_config(&io_conf);
+
+  wifi_init();
+
+  espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
+  espnow_config.qsize.data = 64;
+  espnow_config.qsize.scps_nw = 64;
+  espnow_config.qsize.scps_sec = 64;
+  err = espnow_init(&espnow_config);
+
+  xTaskCreatePinnedToCore(nw_creation_task, "nw_check", 4 * 1024, NULL, 1, NULL,
+                          0);
+#ifdef EVE
+  nw_security_eve_start();
+#else
+  nw_security_start();
+#endif
+
+// #ifdef OTA_INIT
+//   const esp_partition_t *data_partition =
+//       esp_ota_get_next_update_partition(NULL);
+
+//   const esp_partition_pos_t next_pos = {
+//       .offset = data_partition->address,
+//       .size = data_partition->size,
+//   };
+
+//   ESP_ERROR_CHECK(esp_image_get_metadata(&next_pos, &check));
+
+//   ESP_LOGW(TAG, "size : %d", check.image_len);
+// #else
+//   espnow_ota_config_t ota_config = {
+//       .skip_version_check = true,
+//       .progress_report_interval = 10,
+//   };
+//   espnow_ota_responder_start(&ota_config);
+// #endif
+}
