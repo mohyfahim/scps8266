@@ -42,10 +42,12 @@ nw_packet_t *rcv_packet =
 #define CONFIG_MESH_CHANNEL 13
 
 esp_err_t nw_send_packet(uint8_t *data, size_t len, const uint8_t *dest_addr,
-                         espnow_type_t type, nw_packet_type_t subtype) {
+                         espnow_type_t type, nw_packet_type_t subtype, bool ack,
+                         time_t timeout_millis) {
   espnow_frame_head_t frame_head = {
       .channel = 0,
       .broadcast = true,
+      .ack = ack,
       .retransmit_count = 10,
   };
   // TODO: support fragmentation.
@@ -58,7 +60,7 @@ esp_err_t nw_send_packet(uint8_t *data, size_t len, const uint8_t *dest_addr,
     memcpy(packet->body, data, len);
 
   esp_err_t err = espnow_send(type, dest_addr, packet, packet_len, &frame_head,
-                              pdMS_TO_TICKS(100));
+                              pdMS_TO_TICKS(timeout_millis));
 
   return err;
 }

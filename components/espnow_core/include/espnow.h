@@ -101,11 +101,9 @@ typedef struct {
         .ack = 8,                                                              \
         .forward = 8,                                                          \
         .group = 8,                                                            \
-        .provisoning = 0,                                                      \
-        /* .control_bind = 0,   */ /* .control_data = 0, */                    \
+        .provisoning = 0, /* .control_bind = 0,   */ /* .control_data = 0, */  \
         .ota_status = 0,                                                       \
-        .ota_data = 0,                                                         \
-        /*.debug_log = 0,     */ /*.debug_command = 0, */                      \
+        .ota_data = 0, /*.debug_log = 0,     */ /*.debug_command = 0, */       \
         .data = 0,                                                             \
         .sec_status = 0,                                                       \
         .sec = 0,                                                              \

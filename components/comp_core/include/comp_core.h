@@ -1,9 +1,7 @@
-#ifndef PRUEBA_H
-#define PRUEBA_H
-
+#pragma once
 #include <stdint.h>
 
-typedef union {
+typedef union{
   float float_;
   uint8_t uint8_[sizeof(float)];
 } __attribute__((packed)) Float;
@@ -93,4 +91,29 @@ typedef struct {
   unsigned FanAir2_Command : 1;
 } __attribute__((packed)) Data_Receiver;
 
-#endif
+typedef enum
+{
+  Low_Speed = 0x00,
+  Medium_Speed = 0x01, 
+  High_Speed = 0x02
+} __attribute__((packed)) IRExpander_HVACSpeed_e;
+
+typedef enum
+{
+  HVAC_Cooling = 0x00,
+  HVAC_Heating = 0x01
+} __attribute__((packed)) IRExpander_HVACMode_e;
+
+typedef enum
+{
+  HVAC_Off = 0x00,
+  HVAC_On = 0x01
+} __attribute__((packed)) IRExpander_HVAC_OnOff_e;
+
+typedef struct
+{
+  IRExpander_HVAC_OnOff_e OnOff;
+  IRExpander_HVACMode_e HVACMode;
+  IRExpander_HVACSpeed_e Speed;
+  uint8_t Setpoint;
+} __attribute__((packed)) IR_Transmitter;

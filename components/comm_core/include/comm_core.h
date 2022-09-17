@@ -11,7 +11,6 @@
 #define MQTT_BROKER_ADDR "mqtt.giot.ir"
 // #define MQTT_BROKER_ADDR "192.168.1.6"
 
-
 #ifdef __cplusplus
 extern "C" {
 #endif /**< _cplusplus */
@@ -53,7 +52,8 @@ esp_err_t nw_receive_packet(nw_packet_t *data, size_t *len, espnow_type_t type,
  */
 
 esp_err_t nw_send_packet(uint8_t *data, size_t len, const uint8_t *dest_addr,
-                         espnow_type_t type, nw_packet_type_t subtype);
+                         espnow_type_t type, nw_packet_type_t subtype, bool ack,
+                         time_t timeout_millis);
 
 bool get_is_inited();
 

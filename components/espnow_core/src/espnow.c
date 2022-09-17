@@ -21,7 +21,7 @@
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
 #include "esp_system.h"
-#include "esp_wifi.h"
+#include "esp_wifi.h" 
 #include "esp_now.h"
 #include "esp_log.h"
 #include "espnow.h"
@@ -398,7 +398,6 @@ esp_err_t espnow_send(espnow_type_t type, const uint8_t *dest_addr, const void *
         ESP_ERROR_GOTO(ret != ESP_OK, EXIT, "esp_wifi_get_channel, err_name: %s", esp_err_to_name(ret));
         frame_head->channel = primary;
     }
-    ESP_LOGI(TAG,"channel is %d", primary);
 
     const uint8_t *addr = (frame_head->broadcast) ? ESPNOW_ADDR_BROADCAST : dest_addr;
 
@@ -408,7 +407,6 @@ esp_err_t espnow_send(espnow_type_t type, const uint8_t *dest_addr, const void *
             int retry_count = g_espnow_config->send_retry_num;
 
             if (g_set_channel_flag && frame_head->channel == ESPNOW_CHANNEL_ALL) {
-                ESP_LOGW(TAG, "channel changed");
                 esp_wifi_set_channel(g_self_country.schan + i, WIFI_SECOND_CHAN_NONE);
             }
 
@@ -441,8 +439,8 @@ esp_err_t espnow_send(espnow_type_t type, const uint8_t *dest_addr, const void *
                 }
             } while ((frame_head->ack && ++count < frame_head->retransmit_count) || (ret == ESP_ERR_ESPNOW_NO_MEM && --retry_count));
 
-            ESP_ERROR_CONTINUE(ret != ESP_OK, "[%s, %d] <%s> <%d> esp_now_send, channel: %d",
-                               __func__, __LINE__, esp_err_to_name(ret), ret ,g_self_country.schan + i);
+            ESP_ERROR_CONTINUE(ret != ESP_OK, "[%s, %d] <%s> esp_now_send, channel: %d",
+                               __func__, __LINE__, esp_err_to_name(ret), g_self_country.schan + i);
 
             if (!frame_head->broadcast) {
                 write_ticks = (wait_ticks == portMAX_DELAY) ? portMAX_DELAY :

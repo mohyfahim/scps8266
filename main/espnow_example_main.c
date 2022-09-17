@@ -37,7 +37,7 @@ static const char *TAG = "espnow_example";
 
 #define EX_UART_NUM UART_NUM_0
 #define BUF_SIZE 128
-#define TD_BUF_SIZE (sizeof(Data_Transmitter) + 1 + 2)
+#define TD_BUF_SIZE (sizeof(IR_Transmitter) + 2)
 #define RD_BUF_SIZE (TD_BUF_SIZE)
 static QueueHandle_t uart0_queue;
 
@@ -65,19 +65,20 @@ static void uart_event_task(void *pvParameters) {
         ESP_LOGI(TAG, "[UART DATA]: %d", event.size);
         uart_read_bytes(EX_UART_NUM, dtmp, event.size, portMAX_DELAY);
         ESP_LOGI(TAG, "[DATA EVT]:");
-        if (dtmp[0] == '#' && dtmp[event.size - 1] == '#') {
-          err = nw_send_packet(dtmp + 1, event.size - 2, ESPNOW_ADDR_BROADCAST,
-                               ESPNOW_TYPE_SCPS_DATA, NW_DATA_TYPE);
+        // if (dtmp[0] == '#' && dtmp[event.size - 1] == '#') {
+        //   err = nw_send_packet(dtmp + 1, event.size - 2,
+        //   ESPNOW_ADDR_BROADCAST,
+        //                        ESPNOW_TYPE_SCPS_DATA, NW_DATA_TYPE);
 
-          if (err != ESP_OK) {
-            ESP_LOGE(TAG, "can't send data: %s", esp_err_to_name(err));
-          } else {
-            ESP_LOGI(TAG, " data sent successfuly");
-          }
-        } else {
-          ESP_LOGE(TAG, "error in header and footer %.*s", event.size,
-                   (char *)dtmp);
-        }
+        //   if (err != ESP_OK) {
+        //     ESP_LOGE(TAG, "can't send data: %s", esp_err_to_name(err));
+        //   } else {
+        //     ESP_LOGI(TAG, " data sent successfuly");
+        //   }
+        // } else {
+        //   ESP_LOGE(TAG, "error in header and footer %.*s", event.size,
+        //            (char *)dtmp);
+        // }
 
       } break;
 
@@ -147,8 +148,8 @@ void data_receiving(void *params) {
   nw_packet_t *r_data = (nw_packet_t *)heap_caps_malloc(
       sizeof(nw_packet_t) + ESPNOW_DATA_LEN, MALLOC_CAP_8BIT);
   uint8_t *dtmp = (uint8_t *)malloc(TD_BUF_SIZE);
-  dtmp[0] = '#';
-  dtmp[TD_BUF_SIZE - 1] = '#';
+  dtmp[0] = 0x40;
+  dtmp[TD_BUF_SIZE - 1] = 0x0a;
 
   size_t r_len = 0;
   esp_err_t err = ESP_OK;
@@ -156,36 +157,20 @@ void data_receiving(void *params) {
   uint8_t rcv_mac[6];
   ESP_LOGW(TAG, "data rec start");
   while (true) {
-    err = nw_receive_packet(r_data, &r_len, ESPNOW_TYPE_SCPS_CONFIG, rcv_mac,
+    err = nw_receive_packet(r_data, &r_len, ESPNOW_TYPE_SCPS_DATA, rcv_mac,
                             &rssi);
     ESP_ERROR_CONTINUE(err != ESP_OK, "");
     ESP_LOGI(TAG, "received %d + %p", r_len, r_data);
     ESP_LOGI(TAG, "size %d", r_data->header.size);
-    Data_Receiver *r_buffer = (Data_Receiver *)r_data->body;
-    if (r_data->header.type == NW_SYS_CONFIG_TYPE) {
-      dtmp[1] = 0;
-      memcpy(dtmp + 2, (uint8_t *)r_buffer, sizeof(Data_Receiver));
-      ESP_LOGI(TAG, "sys: %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d",
-               r_buffer->HVAC1_Command, r_buffer->HVAC2_Command,
-               r_buffer->HVAC3_Command, r_buffer->FanAir1_Command,
-               r_buffer->FanAir2_Command, r_buffer->HVACMode,
-               r_buffer->WorkMode, r_buffer->Permission,
-               r_buffer->User_Setpoint, r_buffer->HVAC1_Setpoint,
-               r_buffer->HVAC2_Setpoint, r_buffer->HVAC3_Setpoint);
+    IR_Transmitter *r_buffer = (IR_Transmitter *)r_data->body;
+    if (r_data->header.type == NW_DATA_IR_TYPE) {
+      memcpy(dtmp + 1, (uint8_t *)r_buffer, sizeof(IR_Transmitter));
+      ESP_LOGI(TAG, "ir: %d,%d,%d,%d", r_buffer->HVACMode, r_buffer->OnOff,
+               r_buffer->Setpoint, r_buffer->Speed);
       err = uart_write_bytes(EX_UART_NUM, (const char *)dtmp, TD_BUF_SIZE);
       if (err < 1) {
         ESP_LOGE(TAG, "cannot write to serial");
       }
-    } else if (r_data->header.type == NW_ROUTINE_CONFIG_TYPE) {
-      dtmp[1] = 1;
-      memcpy(dtmp + 2, (uint8_t *)r_buffer, sizeof(Data_Receiver));
-
-      ESP_LOGI(TAG, "routine: %.2f,%.2f,%.2f",
-               r_buffer->OtherRoom_Temperature.float_,
-               r_buffer->Outside_Temperature.float_,
-               r_buffer->EngineRoom_Temperature.float_);
-      uart_write_bytes(EX_UART_NUM, (const char *)r_buffer,
-                       r_data->header.size);
     } else {
       ESP_LOGE(TAG, "invalid subtype");
     }
@@ -201,11 +186,11 @@ void app_main() {
   example_wifi_init();
 
   espnow_config_t espnow_config = ESPNOW_INIT_CONFIG_DEFAULT();
-  espnow_config.qsize.data = 16;
-  espnow_config.qsize.scps_nw = 16;
+  // espnow_config.qsize.data = 16;
+  // espnow_config.qsize.scps_nw = 16;
   // espnow_config.qsize.scps_sec = 16;
   espnow_config.qsize.scps_data = 8;
-  espnow_config.qsize.scps_config = 8;
+  // espnow_config.qsize.scps_config = 8;
 
   err = espnow_init(&espnow_config);
   if (err != ESP_OK) {
